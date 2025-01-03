@@ -1,4 +1,10 @@
-# imports
+## https://github.com/NASA-IMPACT/Prithvi-EO-2.0
+## https://huggingface.co/spaces/ibm-nasa-geospatial/Prithvi-EO-2.0-Demo
+## https://huggingface.co/ibm-nasa-geospatial/Prithvi-EO-2.0-300M/blob/main/inference.py
+## https://ml-for-rs.github.io/iclr2024/camera_ready/papers/61.pdf
+
+
+# imports go here
 
 
 ##this is just a stub, all code remains to be added
