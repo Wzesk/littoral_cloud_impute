@@ -1,0 +1,14 @@
+# Core dependencies
+numpy>=1.21.0
+pillow>=9.0.0
+omnicloudmask>=0.1.0
+torch>=2.0.0
+transformers>=4.30.0
+
+# Development dependencies
+pytest>=7.0.0
+ruff>=0.1.0
+black>=23.0.0
+mypy>=1.0.0
+
+# Additional dependencies may be added as the project evolves
