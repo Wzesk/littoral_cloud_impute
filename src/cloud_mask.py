@@ -1,13 +1,26 @@
-"""Cloud mask detection module for satellite imagery using RGB and NIR bands.
+"""Cloud mask detection module for satellite imagery preprocessing.
 
-This module provides functionality for detecting clouds in satellite imagery using RGB
-and NIR bands. It utilizes the omnicloudmask library to generate cloud and shadow
-masks from multispectral imagery.
+This module provides a lightweight preprocessing step for cloud detection in satellite imagery
+using RGB and NIR bands. While more sophisticated models like Prithvi-EO-2.0 can perform
+direct cloud imputation, this module serves as a quick pre-screening tool to:
+
+1. Assess image quality before deeper processing
+2. Calculate usable pixel ratios for scene selection
+3. Identify regions requiring imputation
+4. Optimize processing time by filtering heavily clouded scenes
+
+The module utilizes the omnicloudmask library for efficient binary mask generation.
+While potentially redundant with direct imputation approaches, it offers a fast
+initial assessment that can inform subsequent processing decisions.
 
 Dependencies:
-    - omnicloudmask: Cloud detection model
-    - numpy: Array operations
-    - PIL: Image processing
+-----------
+omnicloudmask : package
+    Cloud detection model
+numpy : package
+    Array operations
+PIL : package
+    Image processing
 """
 
 from typing import Tuple
@@ -24,21 +37,35 @@ def pred_clouds_from_rgbnir(rgb_img: Image.Image, nir_img: Image.Image) -> Tuple
     indicating cloud/shadow presence (255 for cloud/shadow, 0 for clear) along with
     the fraction of usable (clear) pixels.
 
-    Args:
-        rgb_img: RGB image as a PIL Image object
-        nir_img: NIR image as a PIL Image object
+    Parameters:
+    ----------
+    rgb_img : PIL.Image.Image
+        RGB image as a PIL Image object
+    nir_img : PIL.Image.Image
+        NIR image as a PIL Image object
 
     Returns:
-        A tuple containing:
-            - Binary mask where 255 indicates cloud/shadow presence
-            - Fraction of usable (clear) pixels in the image
+    -------
+    mask : PIL.Image.Image
+        Binary mask where 255 indicates cloud/shadow presence
+    usable : float
+        Fraction of usable (clear) pixels in the image
 
-    Example:
-        >>> rgb_img = Image.open('rgb.tif')
-        >>> nir_img = Image.open('nir.tif')
-        >>> mask, usable = pred_clouds_from_rgbnir(rgb_img, nir_img)
-        >>> mask.save('cloud_mask.png')
-        >>> print(f"Usable pixels: {usable:.2%}")
+    Examples:
+    --------
+    >>> from PIL import Image
+    >>> rgb_img = Image.open('rgb.tif')
+    >>> nir_img = Image.open('nir.tif')
+    >>> mask, usable = pred_clouds_from_rgbnir(rgb_img, nir_img)
+    >>> mask.save('cloud_mask.png')
+    >>> print(f"Usable pixels: {usable:.2%}")
+
+    Notes:
+    -----
+    This function serves as a preprocessing step to quickly assess image quality
+    before more computationally intensive operations. While models like Prithvi-EO-2.0
+    can perform direct cloud imputation, this quick assessment helps optimize the
+    processing pipeline by identifying which scenes warrant further processing.
     """
     # Convert rgb and nir images to arrays
     rgb_arr = np.array(rgb_img)

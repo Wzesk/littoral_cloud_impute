@@ -32,13 +32,16 @@ dependencies = [
     # Data handling
     "pandas>=2.0.0",      # Data manipulation and analysis
     "pyyaml>=6.0",        # YAML file handling for configs
+
+    # Development tools
+    "ruff>=0.1.0",        # Fast Python linter
+    "commitizen>=3.12.0", # Standardized commit messages
 ]
 
 [project.optional-dependencies]
 dev = [
     # Code quality and formatting
     "black>=23.0.0",      # Code formatting
-    "ruff>=0.1.0",        # Fast Python linter
     "mypy>=1.0.0",        # Static type checking
     "isort>=5.12.0",      # Import sorting
 
@@ -47,9 +50,7 @@ dev = [
     "pytest-cov>=4.1.0",  # Test coverage reporting
 
     # Development workflow
-    "commitizen>=3.12.0", # Standardized commit messages
     "pre-commit>=3.5.0",  # Git hooks management
-    "cz-conventional-changelog>=3.3.0",  # Conventional changelog
 
     # Documentation
     "sphinx>=7.0.0",      # Documentation generator
@@ -72,7 +73,12 @@ major_version_zero = true
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
 select = ["E", "F", "W", "I", "D", "N"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
 
 [tool.isort]
 profile = "black"
