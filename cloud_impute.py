@@ -47,6 +47,10 @@ class cloud_impution:
 
       # create array with red, green and NIR
       img_arr = np.dstack([self.rgb[:,:,0], self.rgb[:,:,1], self.nir[:,:,0]])
+
+      #reshape array to be bands, height, width
+      img_arr = np.moveaxis(img_arr, -1, 0)
+      
       pred_mask = predict_from_array(img_arr)
 
       #merge cloud mask with cloud shadow mask
