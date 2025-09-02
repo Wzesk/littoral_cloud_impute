@@ -42,256 +42,8 @@ from skimage.transform import resize  # type: ignore
 import re
 import csv
 
-def remove_clouds(
-    target_path: str,
-    features_path: str,
-    *,
-    y_size: int = 256,
-    x_size: int = 256,
-    y_offset: Optional[int] = None,
-    x_offset: Optional[int] = None,
-    threshold: float = 0.2,
-    include_shadow: bool = False,
-    device: str = "auto",
-    return_mask: bool = False,
-):
-    """Impute cloudy pixels using VPint2 guided by a SEnSeIv2 cloud mask.
-
-    Steps:
-    1) Load co-windowed target and features (SAFE .zip or GeoTIFF .tif/.tiff)
-    2) Segment clouds/shadows on the target with SEnSeIv2 to build a binary mask
-    3) Run VPint2 interpolation with the mask to fill cloudy pixels
-
-    Args:
-        target_path: Path to target image (.SAFE.zip or .tif/.tiff)
-        features_path: Path to features image (.SAFE.zip or .tif/.tiff)
-        y_size, x_size: Window size in pixels
-        y_offset, x_offset: Optional window top-left offsets in pixels. If omitted,
-            the window is centered within the target image by default.
-        threshold: VPint2 similarity threshold
-        include_shadow: If True, treat model's shadow class as cloudy
-        device: "auto" to pick CUDA when available, else "cpu"; or explicit "cuda"/"cpu"
-        return_mask: If True, also return the binary cloud mask used
-
-    Returns:
-        pred: ndarray[H, W, C] of imputed target window
-        mask (optional): ndarray[H, W] uint8 binary mask used for imputation
-    """
-    # Compute centered offsets if not provided
-    if x_offset is None or y_offset is None:
-        size_y, size_x = _get_image_size(target_path)
-        if y_size > size_y or x_size > size_x:
-            raise ValueError(
-                f"Requested window {x_size}x{y_size} exceeds target size {size_x}x{size_y}."
-            )
-        if x_offset is None:
-            x_offset = max(0, (size_x - x_size) // 2)
-        if y_offset is None:
-            y_offset = max(0, (size_y - y_size) // 2)
-
-    print(f"Extracting {y_size}x{x_size} window at ({x_offset}, {y_offset})")
-
-    target = _load_window(target_path, y_size, x_size, y_offset, x_offset)
-    features = _load_window(features_path, y_size, x_size, y_offset, x_offset)
-
-    cld_mask = build_cloud_mask(target, include_shadow=include_shadow, device=device)
-    if cld_mask.shape != target.shape[:2]:
-        # Ensure nearest-neighbor resize for masks
-        cld_mask = resize(
-            cld_mask.astype("float32"), target.shape[:2], order=0, preserve_range=True, anti_aliasing=False
-        ).astype(np.uint8)
-
-    vp = VPint2_interpolator(target, features, mask=cld_mask, bands_first=False, threshold=threshold)
-    pred = vp.run()
-    return (pred, cld_mask) if return_mask else pred
 
 
-
-def preprocess_s2_window(
-    target_arr: np.ndarray,
-    band_names: Optional[Sequence[str]] = None,
-    min_size: int = 1068,
-) -> Tuple[np.ndarray, List[dict]]:
-    """Convert a VPint-style S2 window (H, W, C uint16) to SEnSeIv2 input.
-
-    Produces channel-first float array and corresponding band descriptors.
-    Resizes to min_size if the window is smaller than the model's preferred size.
-    """
-    vpint_index = {
-        "B01": 0,
-        "B02": 1,
-        "B03": 2,
-        "B04": 3,
-        "B05": 4,
-        "B06": 5,
-        "B07": 6,
-        "B08": 7,
-        "B8A": 8,
-        "B09": 9,
-        "B11": 10,
-        "B12": 11,
-    }
-    if band_names is None:
-        band_names = list(vpint_index.keys())
-    band_names = [b for b in band_names if b in vpint_index]
-    band_idxs = [vpint_index[b] for b in band_names]
-
-    h, w = target_arr.shape[:2]
-    sub = target_arr[..., band_idxs].astype("float32")
-    sub = (sub / 10000.0).clip(0.0, 1.0)
-    if h < min_size or w < min_size:
-        im_resized = np.zeros((len(band_idxs), min_size, min_size), dtype="float32")
-        for i in range(len(band_idxs)):
-            im_resized[i, ...] = resize(
-                sub[..., i], (min_size, min_size), order=1, preserve_range=True, anti_aliasing=False
-            )
-        im = im_resized
-    else:
-        im = sub.transpose(2, 0, 1)
-
-    s2_desc_by_name = {b["name"]: d for b, d in zip(SENTINEL2_BANDS, SENTINEL2_DESCRIPTORS)}
-    descriptors = [s2_desc_by_name[b] for b in band_names]
-    return im, descriptors
-
-def _select_device(requested: str) -> str:
-    """Resolve device string. "auto" -> cuda if available else cpu."""
-    if requested.lower() == "auto":
-        try:
-            import torch  # type: ignore
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            return "cpu"
-    return requested
-
-
-@lru_cache(maxsize=1)
-def senseiv2_setup(device: str = "auto") -> Tuple[CloudMask, List[str]]:
-    """Load and cache the SEnSeIv2 model and default S2 band names.
-
-    Returns a tuple of (model, band_names) where band_names are a subset of S2 bands
-    expected by the model and present in VPint arrays.
-    """
-    DEVICE = _select_device(device)
-    model_name = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
-    config, weights = get_model_files(model_name)
-    model = CloudMask(config, weights, verbose=False, categorise=True, device=DEVICE)
-    band_names = [
-        b["name"]
-        for b in SENTINEL2_BANDS
-        if b["name"] in ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
-    ]
-    return model, band_names
-
-
-def build_cloud_mask(
-    target: np.ndarray,
-    *,
-    include_shadow: bool = False,
-    device: str = "auto",
-    stride: int = 357,
-) -> np.ndarray:
-    """Generate a binary cloud mask (H, W) from a target window using SEnSeIv2.
-
-    include_shadow: include the shadow class in the mask if True.
-    stride: SEnSeIv2 inference stride.
-    """
-    model, band_names = senseiv2_setup(device)
-    im, descriptors = preprocess_s2_window(target, band_names)
-
-    mask4 = model(im, descriptors=descriptors, stride=stride)
-    # Expected classes: 0-clear, 1-cloud, 2-thick cloud, 3-shadow
-    cloud_like = (mask4 == 1) | (mask4 == 2)
-    if include_shadow:
-        cloud_like = cloud_like | (mask4 == 3)
-    return cloud_like.astype(np.uint8)
-
-
-def _load_window(path: str, y_size: int, x_size: int, y_offset: int, x_offset: int) -> np.ndarray:
-    """Helper to load a window from a SAFE zip or GeoTIFF."""
-    lower = path.lower()
-    if lower.endswith(".zip"):
-        return load_product_windowed(path, y_size, x_size, y_offset, x_offset)
-    if lower.endswith(".tif") or lower.endswith(".tiff"):
-        return load_tiff_windowed(path, y_size, x_size, y_offset, x_offset)
-    raise ValueError(f"Unsupported file format: {path}")
-
-
-def _get_image_size(path: str) -> Tuple[int, int]:
-    """Return (height, width) for a SAFE zip or GeoTIFF using rasterio.
-
-    For SAFE zips, opens the first subdataset to infer base resolution size.
-    """
-    import rasterio  # local import to avoid hard dep at import time
-
-    lower = path.lower()
-    if lower.endswith(".zip"):
-        with rasterio.open(path) as raw:
-            subdatasets = raw.subdatasets
-        if not subdatasets:
-            raise ValueError("SAFE product has no subdatasets: " + path)
-        with rasterio.open(subdatasets[1]) as ds:
-            return ds.height, ds.width
-    if lower.endswith(".tif") or lower.endswith(".tiff"):
-        with rasterio.open(path) as ds:
-            return ds.height, ds.width
-    raise ValueError(f"Unsupported file format: {path}")
-
-
-def _extract_image_date(tags: dict, filename: str) -> str:
-    """Extract an image date string from raster tags or filename.
-
-    Tries common tag keys first, then falls back to parsing YYYYMMDD or
-    YYYYMMDDTHHMMSS from filename. Returns an ISO-like string if possible.
-    """
-    # Try common tag keys
-    cand_keys = [
-        "TIFFTAG_DATETIME",
-        "DATETIME",
-        "DateTime",
-        "ACQUISITION_DATE",
-        "ACQUISITIONDATETIME",
-        "SENSING_TIME",
-    ]
-    for k in cand_keys:
-        v = tags.get(k)
-        if v:
-            # Format variants:
-            #  - TIFFTAG_DATETIME: 'YYYY:MM:DD HH:MM:SS'
-            #  - Others: ISO-ish or freeform
-            m = re.match(r"(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})", v)
-            if m:
-                y, mo, d, h, mi, s = m.groups()
-                return f"{y}-{mo}-{d}T{h}:{mi}:{s}"
-            m = re.match(r"(\d{4})[-:]?(\d{2})[-:]?(\d{2})[ T]?([0-9:]{0,8})", v)
-            if m:
-                y, mo, d, t = m.groups()
-                if t:
-                    t = t.replace(":", "")
-                    t = (t + "000000")[:6]
-                    return f"{y}-{mo}-{d}T{t[0:2]}:{t[2:4]}:{t[4:6]}"
-                return f"{y}-{mo}-{d}"
-            return str(v)
-
-    # Fallback to filename patterns: YYYYMMDDTHHMMSS or YYYYMMDD
-    m = re.search(r"(\d{8})T(\d{6})", filename)
-    if m:
-        ymd, hms = m.groups()
-        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}T{hms[0:2]}:{hms[2:4]}:{hms[4:6]}"
-    m = re.search(r"(\d{8})", filename)
-    if m:
-        ymd = m.group(1)
-        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
-    return ""
-
-
-__all__ = [
-    "remove_clouds",
-    "build_cloud_mask",
-    "preprocess_s2_window",
-    "senseiv2_setup",
-    "batch_remove_clouds_folder",
-]
 
 
 def batch_remove_clouds_folder(
@@ -537,3 +289,246 @@ def batch_remove_clouds_folder(
         print(f"[WARN] Failed to write report {report_path}: {e}")
 
     return saved
+
+def remove_clouds(
+    target_path: str,
+    features_path: str,
+    *,
+    y_size: int = 256,
+    x_size: int = 256,
+    y_offset: Optional[int] = None,
+    x_offset: Optional[int] = None,
+    threshold: float = 0.2,
+    include_shadow: bool = False,
+    device: str = "auto",
+    return_mask: bool = False,
+):
+    """Impute cloudy pixels using VPint2 guided by a SEnSeIv2 cloud mask.
+
+    Steps:
+    1) Load co-windowed target and features (SAFE .zip or GeoTIFF .tif/.tiff)
+    2) Segment clouds/shadows on the target with SEnSeIv2 to build a binary mask
+    3) Run VPint2 interpolation with the mask to fill cloudy pixels
+
+    Args:
+        target_path: Path to target image (.SAFE.zip or .tif/.tiff)
+        features_path: Path to features image (.SAFE.zip or .tif/.tiff)
+        y_size, x_size: Window size in pixels
+        y_offset, x_offset: Optional window top-left offsets in pixels. If omitted,
+            the window is centered within the target image by default.
+        threshold: VPint2 similarity threshold
+        include_shadow: If True, treat model's shadow class as cloudy
+        device: "auto" to pick CUDA when available, else "cpu"; or explicit "cuda"/"cpu"
+        return_mask: If True, also return the binary cloud mask used
+
+    Returns:
+        pred: ndarray[H, W, C] of imputed target window
+        mask (optional): ndarray[H, W] uint8 binary mask used for imputation
+    """
+    # Compute centered offsets if not provided
+    if x_offset is None or y_offset is None:
+        size_y, size_x = _get_image_size(target_path)
+        if y_size > size_y or x_size > size_x:
+            raise ValueError(
+                f"Requested window {x_size}x{y_size} exceeds target size {size_x}x{size_y}."
+            )
+        if x_offset is None:
+            x_offset = max(0, (size_x - x_size) // 2)
+        if y_offset is None:
+            y_offset = max(0, (size_y - y_size) // 2)
+
+    print(f"Extracting {y_size}x{x_size} window at ({x_offset}, {y_offset})")
+
+    target = _load_window(target_path, y_size, x_size, y_offset, x_offset)
+    features = _load_window(features_path, y_size, x_size, y_offset, x_offset)
+
+    cld_mask = build_cloud_mask(target, include_shadow=include_shadow, device=device)
+    if cld_mask.shape != target.shape[:2]:
+        # Ensure nearest-neighbor resize for masks
+        cld_mask = resize(
+            cld_mask.astype("float32"), target.shape[:2], order=0, preserve_range=True, anti_aliasing=False
+        ).astype(np.uint8)
+
+    vp = VPint2_interpolator(target, features, mask=cld_mask, bands_first=False, threshold=threshold)
+    pred = vp.run()
+    return (pred, cld_mask) if return_mask else pred
+
+def preprocess_s2_window(
+    target_arr: np.ndarray,
+    band_names: Optional[Sequence[str]] = None,
+    min_size: int = 1068,
+) -> Tuple[np.ndarray, List[dict]]:
+    """Convert a VPint-style S2 window (H, W, C uint16) to SEnSeIv2 input.
+
+    Produces channel-first float array and corresponding band descriptors.
+    Resizes to min_size if the window is smaller than the model's preferred size.
+    """
+    vpint_index = {
+        "B01": 0,
+        "B02": 1,
+        "B03": 2,
+        "B04": 3,
+        "B05": 4,
+        "B06": 5,
+        "B07": 6,
+        "B08": 7,
+        "B8A": 8,
+        "B09": 9,
+        "B11": 10,
+        "B12": 11,
+    }
+    if band_names is None:
+        band_names = list(vpint_index.keys())
+    band_names = [b for b in band_names if b in vpint_index]
+    band_idxs = [vpint_index[b] for b in band_names]
+
+    h, w = target_arr.shape[:2]
+    sub = target_arr[..., band_idxs].astype("float32")
+    sub = (sub / 10000.0).clip(0.0, 1.0)
+    if h < min_size or w < min_size:
+        im_resized = np.zeros((len(band_idxs), min_size, min_size), dtype="float32")
+        for i in range(len(band_idxs)):
+            im_resized[i, ...] = resize(
+                sub[..., i], (min_size, min_size), order=1, preserve_range=True, anti_aliasing=False
+            )
+        im = im_resized
+    else:
+        im = sub.transpose(2, 0, 1)
+
+    s2_desc_by_name = {b["name"]: d for b, d in zip(SENTINEL2_BANDS, SENTINEL2_DESCRIPTORS)}
+    descriptors = [s2_desc_by_name[b] for b in band_names]
+    return im, descriptors
+
+def _select_device(requested: str) -> str:
+    """Resolve device string. "auto" -> cuda if available else cpu."""
+    if requested.lower() == "auto":
+        try:
+            import torch  # type: ignore
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return requested
+
+@lru_cache(maxsize=1)
+def senseiv2_setup(device: str = "auto") -> Tuple[CloudMask, List[str]]:
+    """Load and cache the SEnSeIv2 model and default S2 band names.
+
+    Returns a tuple of (model, band_names) where band_names are a subset of S2 bands
+    expected by the model and present in VPint arrays.
+    """
+    DEVICE = _select_device(device)
+    model_name = "SEnSeIv2-SegFormerB2-alldata-ambiguous"
+    config, weights = get_model_files(model_name)
+    model = CloudMask(config, weights, verbose=False, categorise=True, device=DEVICE)
+    band_names = [
+        b["name"]
+        for b in SENTINEL2_BANDS
+        if b["name"] in ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B09", "B11", "B12"]
+    ]
+    return model, band_names
+
+def build_cloud_mask(
+    target: np.ndarray,
+    *,
+    include_shadow: bool = False,
+    device: str = "auto",
+    stride: int = 357,
+) -> np.ndarray:
+    """Generate a binary cloud mask (H, W) from a target window using SEnSeIv2.
+
+    include_shadow: include the shadow class in the mask if True.
+    stride: SEnSeIv2 inference stride.
+    """
+    model, band_names = senseiv2_setup(device)
+    im, descriptors = preprocess_s2_window(target, band_names)
+
+    mask4 = model(im, descriptors=descriptors, stride=stride)
+    # Expected classes: 0-clear, 1-cloud, 2-thick cloud, 3-shadow
+    cloud_like = (mask4 == 1) | (mask4 == 2)
+    if include_shadow:
+        cloud_like = cloud_like | (mask4 == 3)
+    return cloud_like.astype(np.uint8)
+
+def _load_window(path: str, y_size: int, x_size: int, y_offset: int, x_offset: int) -> np.ndarray:
+    """Helper to load a window from a SAFE zip or GeoTIFF."""
+    lower = path.lower()
+    if lower.endswith(".zip"):
+        return load_product_windowed(path, y_size, x_size, y_offset, x_offset)
+    if lower.endswith(".tif") or lower.endswith(".tiff"):
+        return load_tiff_windowed(path, y_size, x_size, y_offset, x_offset)
+    raise ValueError(f"Unsupported file format: {path}")
+
+def _get_image_size(path: str) -> Tuple[int, int]:
+    """Return (height, width) for a SAFE zip or GeoTIFF using rasterio.
+
+    For SAFE zips, opens the first subdataset to infer base resolution size.
+    """
+    import rasterio  # local import to avoid hard dep at import time
+
+    lower = path.lower()
+    if lower.endswith(".zip"):
+        with rasterio.open(path) as raw:
+            subdatasets = raw.subdatasets
+        if not subdatasets:
+            raise ValueError("SAFE product has no subdatasets: " + path)
+        with rasterio.open(subdatasets[1]) as ds:
+            return ds.height, ds.width
+    if lower.endswith(".tif") or lower.endswith(".tiff"):
+        with rasterio.open(path) as ds:
+            return ds.height, ds.width
+    raise ValueError(f"Unsupported file format: {path}")
+
+def _extract_image_date(tags: dict, filename: str) -> str:
+    """Extract an image date string from raster tags or filename.
+
+    Tries common tag keys first, then falls back to parsing YYYYMMDD or
+    YYYYMMDDTHHMMSS from filename. Returns an ISO-like string if possible.
+    """
+    # Try common tag keys
+    cand_keys = [
+        "TIFFTAG_DATETIME",
+        "DATETIME",
+        "DateTime",
+        "ACQUISITION_DATE",
+        "ACQUISITIONDATETIME",
+        "SENSING_TIME",
+    ]
+    for k in cand_keys:
+        v = tags.get(k)
+        if v:
+            # Format variants:
+            #  - TIFFTAG_DATETIME: 'YYYY:MM:DD HH:MM:SS'
+            #  - Others: ISO-ish or freeform
+            m = re.match(r"(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2}):(\d{2})", v)
+            if m:
+                y, mo, d, h, mi, s = m.groups()
+                return f"{y}-{mo}-{d}T{h}:{mi}:{s}"
+            m = re.match(r"(\d{4})[-:]?(\d{2})[-:]?(\d{2})[ T]?([0-9:]{0,8})", v)
+            if m:
+                y, mo, d, t = m.groups()
+                if t:
+                    t = t.replace(":", "")
+                    t = (t + "000000")[:6]
+                    return f"{y}-{mo}-{d}T{t[0:2]}:{t[2:4]}:{t[4:6]}"
+                return f"{y}-{mo}-{d}"
+            return str(v)
+
+    # Fallback to filename patterns: YYYYMMDDTHHMMSS or YYYYMMDD
+    m = re.search(r"(\d{8})T(\d{6})", filename)
+    if m:
+        ymd, hms = m.groups()
+        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}T{hms[0:2]}:{hms[2:4]}:{hms[4:6]}"
+    m = re.search(r"(\d{8})", filename)
+    if m:
+        ymd = m.group(1)
+        return f"{ymd[0:4]}-{ymd[4:6]}-{ymd[6:8]}"
+    return ""
+
+__all__ = [
+    "remove_clouds",
+    "build_cloud_mask",
+    "preprocess_s2_window",
+    "senseiv2_setup",
+    "batch_remove_clouds_folder",
+]
